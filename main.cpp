@@ -1,4 +1,4 @@
-#include <QApplication>
+﻿#include <QApplication>
 #include <QWindow>
 #include <QWidget>
 #include <QOpenGLWidget>
@@ -12,6 +12,9 @@
 #include <iostream>
 #include <mutex>
 
+#define DISABLE_SHARE_CONTEXT 0
+
+// 渲染一个不断缩小的红色方块纹理或自定义纹理
 class Renderer: public QOpenGLFunctions {
     uint textureid = 0;
     uint program = 0;
@@ -144,6 +147,7 @@ public:
 };
 
 
+// 在后台线程渲染好一个texture并回调
 struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
     QOffscreenSurface *surface = nullptr;
     QOpenGLContext *context = nullptr;
@@ -167,10 +171,12 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
 
         using clock = std::chrono::steady_clock;
 
+        int framecount = 0;
+        auto begin_time = clock::now();
         while (!isInterruptionRequested()) {
             context->makeCurrent(surface);
 
-            auto begin_time = clock::now();
+            auto iter_begin = clock::now();
 
             GLint prevfbo;
             glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevfbo);
@@ -202,23 +208,29 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
 
             auto sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
-            auto endtime = clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endtime - begin_time).count();
+            auto iter_end = clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - iter_begin).count();
 
-            std::cerr << "offscreen render cost = " << duration << "us" << std::endl;
+            // if (duration > 10000)
+                std::cerr << "offscreen render cost = " << duration << "us" << std::endl;
 
             if (!!onTexAvailable)
                 onTexAvailable(tex, sync);
-            else
+            else {
+                glDeleteTextures(1, &tex);
                 glDeleteSync(sync);
+            }
 
             context->doneCurrent();
-            QThread::msleep(20);
+            
+            ++framecount;
+            std::this_thread::sleep_until(begin_time + framecount / 60.0 * std::chrono::microseconds(1000000));
         }
     }
 };
 
 
+// OpenGL控件，只是按固定速率把后台线程送来的纹理展示而已
 class MyWidget: public QOpenGLWidget, public QOpenGLExtraFunctions {
     Renderer renderer_;
     OffScreenRenderer* offrenderer_;
@@ -258,31 +270,34 @@ protected:
         renderer_.init();
 
         QOpenGLContext *current = context();
-        doneCurrent();
+        auto format = current->format();
 
         offrenderer_ = new OffScreenRenderer();
-        offrenderer_->context->setFormat(current->format());
-        offrenderer_->context->setShareContext(current);
+        offrenderer_->context->setFormat(format);
+        if (!DISABLE_SHARE_CONTEXT)
+            offrenderer_->context->setShareContext(current);
         offrenderer_->context->create();
         offrenderer_->context->moveToThread(offrenderer_);
 
-        offrenderer_->surface->setFormat(current->format());
+        offrenderer_->surface->setFormat(format);
         offrenderer_->surface->create();
 
         offrenderer_->moveToThread(offrenderer_);
 
-        offrenderer_->onTexAvailable = [this](auto tex, auto sync) {
-            std::unique_lock lg(mutex_);
-            SetTex(tex, sync);
-        };
+        if (!DISABLE_SHARE_CONTEXT) {
+            offrenderer_->onTexAvailable = [this](auto tex, auto sync) {
+                std::unique_lock lg(mutex_);
+                SetTex(tex, sync);
+            };
+        }
         offrenderer_->start();
 
-        makeCurrent();
-
         connect(&timer_, &QTimer::timeout, [this]() {
+            if (DISABLE_SHARE_CONTEXT)
+                renderer_.tick();
             update();
         });
-        timer_.start(30);
+        timer_.start(16);
     }
 
     void paintGL() override {
@@ -299,10 +314,15 @@ protected:
 
 
 int main(int argc, char** argv){
-    // QLoggingCategory::setFilterRules("*.debug=true");
+    QLoggingCategory::setFilterRules("*.debug=true");
 
     QApplication::setAttribute(Qt::AA_UseDesktopOpenGL);
-    QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
+    if (!DISABLE_SHARE_CONTEXT)
+        QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
+
+    QSurfaceFormat format = QSurfaceFormat::defaultFormat();
+    //format.setSwapInterval(0);
+    QSurfaceFormat::setDefaultFormat(format);
 
     // 加了以后会必须得用vertex buffer object不然报错
     // QSurfaceFormat format;
