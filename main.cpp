@@ -3,39 +3,27 @@
 #include <QWidget>
 #include <QOpenGLWidget>
 #include <QOpenGLFunctions>
+#include <QOpenGLExtraFunctions>
 #include <QTimer>
+#include <QThread>
+#include <QOffscreenSurface>
+#include <QLoggingCategory>
 
 #include <iostream>
+#include <mutex>
 
-class MyWidget: public QOpenGLWidget, public QOpenGLFunctions {
-    QTimer timer_;
-    int pos = 0;
-
+class Renderer: public QOpenGLFunctions {
     uint textureid = 0;
-    uint myfbo = 0;
-
     uint program = 0;
 
+    float pos = -1.0f;
 public:
-    MyWidget(QWidget* parent = nullptr): QOpenGLWidget(parent) {
-        timer_.setInterval(4);
-        QObject::connect(&timer_, &QTimer::timeout, [this]() {
-            pos += 2;
-            if (pos > width())
-                pos = 0;
-            update();
-        });
-        timer_.start();
+    Renderer()
+    {
     }
 
-    ~MyWidget() override {
-        timer_.stop();
-    }
-
-protected:
-    void initializeGL() override {
+    void init() {
         initializeOpenGLFunctions();
-
         glGenTextures(1, &textureid);
         static uint8_t data[] = {
             255, 0, 0, 255
@@ -48,7 +36,6 @@ protected:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, 0);
 
-        // 编译opengl es 2.0 shader
         const char* vertexShaderSource = R"(#version 100
             attribute vec4 position;
             attribute vec2 texcoord;
@@ -77,7 +64,7 @@ protected:
         glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
         if (!success) {
             glGetShaderInfoLog(vertexShader, 512, nullptr, infoLog);
-            std::cout << "Vertex Shader Compilation Failed:" << infoLog;
+            std::cerr << "Vertex Shader Compilation Failed:" << infoLog;
         }
         
         uint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
@@ -86,7 +73,7 @@ protected:
         glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
         if (!success) {
             glGetShaderInfoLog(fragmentShader, 512, nullptr, infoLog);
-            std::cout << "Fragment Shader Compilation Failed:" << infoLog;
+            std::cerr << "Fragment Shader Compilation Failed:" << infoLog;
         }
         
         glAttachShader(program, vertexShader);
@@ -95,23 +82,30 @@ protected:
         glGetProgramiv(program, GL_LINK_STATUS, &success);
         if (!success) {
             glGetProgramInfoLog(program, 512, nullptr, infoLog);
-            std::cout << "Program Linking Failed:" << infoLog;
+            std::cerr << "Program Linking Failed:" << infoLog;
         }
         glDeleteShader(vertexShader);
         glDeleteShader(fragmentShader);
     }
 
-    void paintGL() override {
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+    void tick() {
+        pos += 0.01f;
+        if (pos >= 1.0f)
+            pos = -1.0f;
+    }
 
-        auto fpos = 2.0f * pos / width() - 1;
+    void draw(int textureid = 0) {
+        if (textureid == 0)
+            textureid = this->textureid;
+        glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        assert(glGetError() == GL_NO_ERROR);
 
         float vertex[] = {
-             fpos, -1.0f, 0.0f,
-             1.0f, -1.0f, 0.0f,
-             fpos,  1.0f, 0.0f,
-             1.0f,  1.0f, 0.0f,
+            pos,  -1.0f, 0.0f,
+            1.0f, -1.0f, 0.0f,
+            pos,   1.0f, 0.0f,
+            1.0f,  1.0f, 0.0f,
         };
         float texcoord[] = {
             0.0f, 1.0f,
@@ -121,24 +115,201 @@ protected:
         };
 
         glUseProgram(program);
+
+        int r;
+
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, textureid);
+        assert((r = glGetError()) == GL_NO_ERROR);
+
         glUniform1i(glGetUniformLocation(program, "tex"), 0);
+        assert((r = glGetError()) == GL_NO_ERROR);
+
         GLint positionAttrib = glGetAttribLocation(program, "position");
+        assert((r = glGetError()) == GL_NO_ERROR);
         glVertexAttribPointer(positionAttrib, 3, GL_FLOAT, GL_FALSE, 0, vertex);
+        assert((r = glGetError()) == GL_NO_ERROR);
         glEnableVertexAttribArray(positionAttrib);
+        assert((r = glGetError()) == GL_NO_ERROR);
 
         GLint texcoordAttrib = glGetAttribLocation(program, "texcoord");
+        assert((r = glGetError()) == GL_NO_ERROR);
         glVertexAttribPointer(texcoordAttrib, 2, GL_FLOAT, GL_FALSE, 0, texcoord);
+        assert((r = glGetError()) == GL_NO_ERROR);
         glEnableVertexAttribArray(texcoordAttrib);
+        assert((r = glGetError()) == GL_NO_ERROR);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        assert((r = glGetError()) == GL_NO_ERROR);
+    }
+};
+
+
+struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
+    QOffscreenSurface *surface = nullptr;
+    QOpenGLContext *context = nullptr;
+    
+    OffScreenRenderer()
+    {
+        context = new QOpenGLContext();
+        surface = new QOffscreenSurface();
+    }
+
+    std::function<void(GLuint tex, GLsync sync)> onTexAvailable;
+
+    void run() override {
+        context->makeCurrent(surface);
+        initializeOpenGLFunctions();
+
+        Renderer renderer;
+        renderer.init();
+
+        context->doneCurrent();
+
+        using clock = std::chrono::steady_clock;
+
+        while (!isInterruptionRequested()) {
+            context->makeCurrent(surface);
+
+            auto begin_time = clock::now();
+
+            GLint prevfbo;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevfbo);
+
+            GLuint tex, fbo;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, 512, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+    
+            glGenFramebuffers(1, &fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                std::cerr << "Framebuffer is not complete!" << std::endl;
+            }
+
+            renderer.tick();
+            glViewport(0, 0, 512, 512);
+            renderer.draw();
+
+            glBindFramebuffer(GL_FRAMEBUFFER, prevfbo);
+            glDeleteFramebuffers(1, &fbo);
+
+            auto sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+            auto endtime = clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endtime - begin_time).count();
+
+            std::cerr << "offscreen render cost = " << duration << "us" << std::endl;
+
+            if (!!onTexAvailable)
+                onTexAvailable(tex, sync);
+            else
+                glDeleteSync(sync);
+
+            context->doneCurrent();
+            QThread::msleep(20);
+        }
+    }
+};
+
+
+class MyWidget: public QOpenGLWidget, public QOpenGLExtraFunctions {
+    Renderer renderer_;
+    OffScreenRenderer* offrenderer_;
+    QTimer timer_;
+
+    std::mutex mutex_;
+    GLuint tex = 0;
+    GLsync sync = 0;
+
+    void CleanTex() {
+        if (tex != 0) {
+            glDeleteTextures(1, &tex);
+            tex = 0;
+        }
+        if (sync != 0) {
+            glDeleteSync(sync);
+            sync = 0;
+        }
+    }
+
+    void SetTex(GLuint tex, GLsync sync) {
+        CleanTex();
+        this->tex = tex;
+        this->sync = sync;
+    }
+
+public:
+    MyWidget(QWidget* parent = nullptr): QOpenGLWidget(parent) {
+    }
+
+    ~MyWidget() override {
+    }
+
+protected:
+    void initializeGL() override {
+        initializeOpenGLFunctions();
+        renderer_.init();
+
+        QOpenGLContext *current = context();
+        doneCurrent();
+
+        offrenderer_ = new OffScreenRenderer();
+        offrenderer_->context->setFormat(current->format());
+        offrenderer_->context->setShareContext(current);
+        offrenderer_->context->create();
+        offrenderer_->context->moveToThread(offrenderer_);
+
+        offrenderer_->surface->setFormat(current->format());
+        offrenderer_->surface->create();
+
+        offrenderer_->moveToThread(offrenderer_);
+
+        offrenderer_->onTexAvailable = [this](auto tex, auto sync) {
+            std::unique_lock lg(mutex_);
+            SetTex(tex, sync);
+        };
+        offrenderer_->start();
+
+        makeCurrent();
+
+        connect(&timer_, &QTimer::timeout, [this]() {
+            update();
+        });
+        timer_.start(30);
+    }
+
+    void paintGL() override {
+        std::unique_lock lg(mutex_);
+        if (tex != 0) {
+            glWaitSync(sync, 0, GL_TIMEOUT_IGNORED);
+            glViewport(0, 0, width(), height());
+            renderer_.draw(tex);
+        } else {
+            renderer_.draw();
+        }
     }
 };
 
 
 int main(int argc, char** argv){
+    // QLoggingCategory::setFilterRules("*.debug=true");
+
     QApplication::setAttribute(Qt::AA_UseDesktopOpenGL);
     QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
+
+    // 加了以后会必须得用vertex buffer object不然报错
+    // QSurfaceFormat format;
+    // format.setVersion(4, 1);
+    // format.setProfile(QSurfaceFormat::CoreProfile);
+    // QSurfaceFormat::setDefaultFormat(format);
+
     QApplication app(argc, argv);
     auto w = new MyWidget();
     w->show();
