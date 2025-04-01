@@ -1,0 +1,9 @@
+cmake_minimum_required(VERSION 3.10.0)
+project(qtgl VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_PREFIX_PATH D:/devspace/qtgl/msvc2019_64/lib/cmake/Qt5)
+
+find_package(Qt5 REQUIRED Widgets Core OpenGL)
+
+add_executable(qtgl main.cpp)
+target_link_libraries(qtgl PRIVATE Qt5::Widgets Qt5::Core Qt5::OpenGL)
