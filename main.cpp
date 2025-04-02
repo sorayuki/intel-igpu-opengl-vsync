@@ -158,7 +158,7 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
         surface = new QOffscreenSurface();
     }
 
-    std::function<void(GLuint tex, GLsync sync)> onTexAvailable;
+    std::function<bool(GLuint tex, GLsync sync)> onTexAvailable;
 
     void run() override {
         context->makeCurrent(surface);
@@ -211,12 +211,14 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
             auto iter_end = clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - iter_begin).count();
 
-            // if (duration > 10000)
+            if (duration > 10000)
                 std::cerr << "offscreen render cost = " << duration << "us" << std::endl;
 
-            if (!!onTexAvailable)
-                onTexAvailable(tex, sync);
-            else {
+            if (![&]() {
+                if (!onTexAvailable)
+                    return false;
+                return onTexAvailable(tex, sync);
+            }()) {
                 glDeleteTextures(1, &tex);
                 glDeleteSync(sync);
             }
@@ -224,7 +226,7 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
             context->doneCurrent();
             
             ++framecount;
-            std::this_thread::sleep_until(begin_time + framecount / 60.0 * std::chrono::microseconds(1000000));
+            std::this_thread::sleep_until(begin_time + framecount / 100.0 * std::chrono::microseconds(1000000));
         }
     }
 };
@@ -236,7 +238,6 @@ class MyWidget: public QOpenGLWidget, public QOpenGLExtraFunctions {
     OffScreenRenderer* offrenderer_;
     QTimer timer_;
 
-    std::mutex mutex_;
     GLuint tex = 0;
     GLsync sync = 0;
 
@@ -286,8 +287,9 @@ protected:
 
         if (!DISABLE_SHARE_CONTEXT) {
             offrenderer_->onTexAvailable = [this](auto tex, auto sync) {
-                std::unique_lock lg(mutex_);
-                SetTex(tex, sync);
+                return QMetaObject::invokeMethod(this, [=]() {
+                    SetTex(tex, sync);
+                }, Qt::QueuedConnection);
             };
         }
         offrenderer_->start();
@@ -301,7 +303,6 @@ protected:
     }
 
     void paintGL() override {
-        std::unique_lock lg(mutex_);
         if (tex != 0) {
             glWaitSync(sync, 0, GL_TIMEOUT_IGNORED);
             glViewport(0, 0, width(), height());
@@ -314,7 +315,7 @@ protected:
 
 
 int main(int argc, char** argv){
-    QLoggingCategory::setFilterRules("*.debug=true");
+    // QLoggingCategory::setFilterRules("*.debug=true");
 
     QApplication::setAttribute(Qt::AA_UseDesktopOpenGL);
     if (!DISABLE_SHARE_CONTEXT)
