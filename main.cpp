@@ -14,8 +14,16 @@
 
 #define DISABLE_SHARE_CONTEXT 0
 
+#define CHECKGLERR { \
+    int r = glGetError(); \
+    if (r != GL_NO_ERROR) \
+        __debugbreak(); \
+}
+
+#define CLEARGLERR while(glGetError() != GL_NO_ERROR)
+
 // 渲染一个不断缩小的红色方块纹理或自定义纹理
-class Renderer: public QOpenGLFunctions {
+class Renderer: public QOpenGLExtraFunctions {
     uint textureid = 0;
     uint program = 0;
 
@@ -102,7 +110,7 @@ public:
             textureid = this->textureid;
         glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        assert(glGetError() == GL_NO_ERROR);
+        CHECKGLERR;
 
         float vertex[] = {
             pos,  -1.0f, 0.0f,
@@ -119,30 +127,28 @@ public:
 
         glUseProgram(program);
 
-        int r;
-
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, textureid);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
 
         glUniform1i(glGetUniformLocation(program, "tex"), 0);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
 
         GLint positionAttrib = glGetAttribLocation(program, "position");
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
         glVertexAttribPointer(positionAttrib, 3, GL_FLOAT, GL_FALSE, 0, vertex);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
         glEnableVertexAttribArray(positionAttrib);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
 
         GLint texcoordAttrib = glGetAttribLocation(program, "texcoord");
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
         glVertexAttribPointer(texcoordAttrib, 2, GL_FLOAT, GL_FALSE, 0, texcoord);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
         glEnableVertexAttribArray(texcoordAttrib);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        assert((r = glGetError()) == GL_NO_ERROR);
+        CHECKGLERR;
     }
 };
 
@@ -163,6 +169,7 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
     void run() override {
         context->makeCurrent(surface);
         initializeOpenGLFunctions();
+        CLEARGLERR;
 
         Renderer renderer;
         renderer.init();
@@ -175,6 +182,7 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
         auto begin_time = clock::now();
         while (!isInterruptionRequested()) {
             context->makeCurrent(surface);
+            CLEARGLERR;
 
             auto iter_begin = clock::now();
 
@@ -190,10 +198,12 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
+            CHECKGLERR;
     
             glGenFramebuffers(1, &fbo);
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            CHECKGLERR;
     
             if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
                 std::cerr << "Framebuffer is not complete!" << std::endl;
@@ -201,12 +211,14 @@ struct OffScreenRenderer: public QThread, public QOpenGLExtraFunctions {
 
             renderer.tick();
             glViewport(0, 0, 512, 512);
+            CHECKGLERR;
             renderer.draw();
 
             glBindFramebuffer(GL_FRAMEBUFFER, prevfbo);
             glDeleteFramebuffers(1, &fbo);
 
             auto sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            CHECKGLERR;
 
             auto iter_end = clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - iter_begin).count();
@@ -305,7 +317,9 @@ protected:
     void paintGL() override {
         if (tex != 0) {
             glWaitSync(sync, 0, GL_TIMEOUT_IGNORED);
+            CHECKGLERR;
             glViewport(0, 0, width(), height());
+            CHECKGLERR;
             renderer_.draw(tex);
         } else {
             renderer_.draw();
